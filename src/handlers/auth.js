@@ -1,160 +1,240 @@
-const { Markup } = require('telegraf');
-const User = require('../models/User');
-const AccessRequest = require('../models/AccessRequest');
-const config = require('../config');
-const db = require('../database/connection');
+const database = require('../database/connection');
+const keyboards = require('../keyboards');
 
-module.exports = function setupAuthHandlers(bot) {
-  // Обработчик команды /start
-  bot.start(async (ctx) => {
-    const userId = ctx.from.id;
+function authHandlers(bot) {
+  
+  // Запрос доступа
+  bot.onText(/\/request_access/, async (msg) => {
+    const chatId = msg.chat.id;
     
     try {
-      // Проверяем существование пользователя
-      let user = await User.findByTelegramId(userId);
+      // Проверяем, есть ли пользователь уже в базе
+      const existingUser = await database.get(
+        'SELECT * FROM users WHERE telegram_id = ?',
+        [msg.from.id]
+      );
       
-      if (!user) {
-        // Создаем нового пользователя с безопасными данными
-        const userData = {
-          telegram_id: userId,
-          username: ctx.from.username || null,  // ← ИСПРАВЛЕНО
-          first_name: ctx.from.first_name || 'Пользователь',
-          last_name: ctx.from.last_name || null // ← ИСПРАВЛЕНО
-        };
-        
-        user = await User.create(userData);
-        
-        await ctx.reply(
-          '👋 Добро пожаловать!\n\n' +
-          'Для доступа к функциям бота отправьте команду /zapros\n\n' +
-          'После одобрения администратора вы сможете:\n' +
-          '• Отслеживать посылки из Китая\n' +
-          '• Управлять складом\n' +
-          '• Получать напоминания'
-        );
-      } else if (user.is_active) {
-        // Пользователь активен - показываем меню
-        await ctx.reply(
-          `✅ С возвращением, ${user.first_name}!\n\n` +
-          'Используйте меню ниже для работы с ботом:',
-          {
-            reply_markup: {
-              keyboard: [
-                ['📦 Мои посылки', '➕ Добавить посылку'],
-                ['🏪 Склад', '🔔 Напоминания'],
-                ['📊 Статистика', '🆘 Помощь']
-              ],
-              resize_keyboard: true
-            }
-          }
-        );
-      } else {
-        // Пользователь не активен
-        await ctx.reply(
-          '⏳ Ваш запрос на доступ еще не рассмотрен.\n' +
-          'Ожидайте подтверждения от администратора.'
-        );
-      }
-    } catch (error) {
-      console.error('Ошибка в /start:', error.message);
-      await ctx.reply('Произошла ошибка при регистрации. Попробуйте позже.');
-    }
-  });
-
-  // Команда /zapros
-  bot.command('zapros', async (ctx) => {
-    const userId = ctx.from.id;
-    
-    try {
-      // Проверяем пользователя
-      let user = await User.findByTelegramId(userId);
-      
-      if (!user) {
-        // Создаем пользователя с безопасными данными
-        const userData = {
-          telegram_id: userId,
-          username: ctx.from.username || null,  // ← ИСПРАВЛЕНО
-          first_name: ctx.from.first_name || 'Пользователь',
-          last_name: ctx.from.last_name || null // ← ИСПРАВЛЕНО
-        };
-        
-        user = await User.create(userData);
-      }
-      
-      // Проверяем активный запрос
-      const existingRequest = await AccessRequest.findByUser(user.id);
-      
-      if (existingRequest) {
-        await ctx.reply(
-          '📨 Ваш запрос уже отправлен и ожидает рассмотрения.'
-        );
+      if (existingUser) {
+        if (existingUser.is_active) {
+          await bot.sendMessage(chatId, 
+            '✅ Вы уже имеете доступ к боту!',
+            keyboards.mainMenu()
+          );
+        } else {
+          await bot.sendMessage(chatId, 
+            '⏳ Ваш запрос на доступ уже находится на рассмотрении у администратора.',
+            keyboards.backToStart()
+          );
+        }
         return;
       }
       
-      // Создаем новый запрос
-      await AccessRequest.create(user.id);
+      // Создаем нового пользователя
+      await database.insert('users', {
+        telegram_id: msg.from.id,
+        username: msg.from.username || null,
+        first_name: msg.from.first_name,
+        last_name: msg.from.last_name || null,
+        is_active: false,
+        is_admin: false,
+        created_at: new Date()
+      });
       
-      // Отправляем уведомление админу
-      await sendAdminNotification(ctx, user);
+      // Получаем ID созданного пользователя
+      const newUser = await database.get(
+        'SELECT id FROM users WHERE telegram_id = ?',
+        [msg.from.id]
+      );
       
-      await ctx.reply(
-        '✅ Запрос на доступ успешно отправлен!\n\n' +
-        'Администратор получил уведомление и скоро рассмотрит вашу заявку.\n' +
-        'Вы получите сообщение когда доступ будет предоставлен.'
+      // Создаем запрос на доступ
+      await database.insert('access_requests', {
+        user_id: newUser.id,
+        status: 'pending',
+        created_at: new Date()
+      });
+      
+      // Уведомляем администраторов
+      const admins = await database.query(
+        'SELECT telegram_id FROM users WHERE is_admin = TRUE'
+      );
+      
+      const userInfo = `
+👤 <b>Новый запрос на доступ</b>
+
+ID: ${newUser.id}
+Имя: ${msg.from.first_name}
+Фамилия: ${msg.from.last_name || 'Не указана'}
+Username: @${msg.from.username || 'Не указан'}
+Telegram ID: ${msg.from.id}
+      `;
+      
+      for (const admin of admins) {
+        try {
+          await bot.sendMessage(admin.telegram_id, userInfo, {
+            parse_mode: 'HTML',
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  { text: '✅ Одобрить', callback_data: `approve_access:${newUser.id}` },
+                  { text: '❌ Отклонить', callback_data: `reject_access:${newUser.id}` }
+                ]
+              ]
+            }
+          });
+        } catch (error) {
+          console.error('Ошибка при отправке уведомления админу:', error);
+        }
+      }
+      
+      await bot.sendMessage(chatId, 
+        '✅ Ваш запрос на доступ отправлен администратору!\n' +
+        'Мы уведомим вас, как только доступ будет предоставлен.',
+        keyboards.backToStart()
       );
       
     } catch (error) {
-      console.error('Ошибка в /zapros:', error.message);
-      await ctx.reply('Произошла ошибка при отправке запроса.');
+      console.error('Ошибка при запросе доступа:', error);
+      await bot.sendMessage(chatId, 
+        '❌ Произошла ошибка при отправке запроса.',
+        keyboards.backToStart()
+      );
     }
   });
-
-  // Функция отправки уведомления админу
-  async function sendAdminNotification(ctx, user) {
+  
+  // Обработка callback-запросов для доступа
+  bot.on('callback_query', async (callbackQuery) => {
+    const data = callbackQuery.data;
+    
+    if (!data.startsWith('approve_access:') && !data.startsWith('reject_access:')) {
+      return;
+    }
+    
+    const chatId = callbackQuery.message.chat.id;
+    const [action, userId] = data.split(':');
+    const isApproval = action === 'approve_access';
+    
     try {
-      if (!config.ADMIN_ID) {
-        console.warn('⚠️ ADMIN_ID не установлен в .env');
+      // Проверяем права администратора
+      const admin = await database.get(
+        'SELECT * FROM users WHERE telegram_id = ? AND is_admin = TRUE',
+        [callbackQuery.from.id]
+      );
+      
+      if (!admin) {
+        await bot.answerCallbackQuery(callbackQuery.id, { 
+          text: '❌ Только администраторы могут выполнять это действие.' 
+        });
         return;
       }
       
-      const message = 
-        `📨 НОВЫЙ ЗАПРОС НА ДОСТУП!\n\n` +
-        `👤 Пользователь: ${user.first_name} ${user.last_name || ''}\n` +
-        `📛 ${user.username ? '@' + user.username : 'без username'}\n` +
-        `🆔 ID: ${user.telegram_id}\n` +
-        `📅 Дата: ${new Date().toLocaleString('ru-RU')}\n\n` +
-        `Для обработки используйте /requests`;
+      // Обновляем статус запроса
+      await database.update('access_requests',
+        { user_id: userId },
+        {
+          status: isApproval ? 'approved' : 'rejected',
+          admin_id: admin.id,
+          decision_date: new Date()
+        }
+      );
       
-      // Используем глобальный экземпляр бота если доступен
-      if (global.botInstance) {
-        await global.botInstance.telegram.sendMessage(config.ADMIN_ID, message, {
-          reply_markup: {
-            inline_keyboard: [[
-              {
-                text: '📋 Просмотреть запросы',
-                callback_data: 'view_requests'
-              }
-            ]]
+      if (isApproval) {
+        // Активируем пользователя
+        await database.update('users',
+          { id: userId },
+          {
+            is_active: true,
+            updated_at: new Date()
           }
-        });
+        );
+        
+        // Получаем данные пользователя для уведомления
+        const user = await database.get('SELECT * FROM users WHERE id = ?', [userId]);
+        
+        if (user && user.telegram_id) {
+          try {
+            await bot.sendMessage(user.telegram_id,
+              '🎉 <b>Ваш запрос на доступ одобрен!</b>\n\n' +
+              'Теперь вы можете использовать все функции бота.\n' +
+              'Используйте /menu для начала работы.',
+              {
+                parse_mode: 'HTML',
+                reply_markup: keyboards.mainMenu()
+              }
+            );
+          } catch (error) {
+            console.error('Ошибка при отправке уведомления пользователю:', error);
+          }
+        }
+        
+        await bot.editMessageText(
+          `✅ Запрос пользователя одобрен!\n\n` +
+          `Пользователь ${user.first_name} теперь имеет доступ к боту.`,
+          {
+            chat_id: chatId,
+            message_id: callbackQuery.message.message_id
+          }
+        );
+        
+        await bot.answerCallbackQuery(callbackQuery.id, { text: 'Доступ предоставлен!' });
+        
       } else {
-        // Или используем ctx.telegram (работает только в обработчиках сообщений)
-        await ctx.telegram.sendMessage(config.ADMIN_ID, message, {
-          reply_markup: {
-            inline_keyboard: [[
+        // Отклоняем запрос
+        const user = await database.get('SELECT * FROM users WHERE id = ?', [userId]);
+        
+        if (user && user.telegram_id) {
+          try {
+            await bot.sendMessage(user.telegram_id,
+              '❌ <b>Ваш запрос на доступ отклонен</b>\n\n' +
+              'Администратор отклонил ваш запрос на доступ к боту.\n' +
+              'Если вы считаете, что это ошибка, свяжитесь с администратором.',
               {
-                text: '📋 Просмотреть запросы',
-                callback_data: 'view_requests'
+                parse_mode: 'HTML',
+                reply_markup: keyboards.backToStart()
               }
-            ]]
+            );
+          } catch (error) {
+            console.error('Ошибка при отправке уведомления пользователю:', error);
           }
-        });
+        }
+        
+        await bot.editMessageText(
+          `❌ Запрос пользователя отклонен.\n\n` +
+          `Пользователь ${user.first_name} не получил доступ к боту.`,
+          {
+            chat_id: chatId,
+            message_id: callbackQuery.message.message_id
+          }
+        );
+        
+        await bot.answerCallbackQuery(callbackQuery.id, { text: 'Доступ отклонен!' });
       }
       
-      console.log(`✅ Уведомление отправлено администратору ${config.ADMIN_ID}`);
+    } catch (error) {
+      console.error('Ошибка при обработке запроса доступа:', error);
+      await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Произошла ошибка' });
+    }
+  });
+  
+  // Выход из системы
+  bot.onText(/\/logout/, async (msg) => {
+    const chatId = msg.chat.id;
+    
+    try {
+      await bot.sendMessage(chatId,
+        '👋 Вы вышли из системы.\n\n' +
+        'Для повторного входа используйте /start',
+        {
+          reply_markup: {
+            remove_keyboard: true
+          }
+        }
+      );
       
     } catch (error) {
-      console.error('Ошибка отправки админу:', error.message);
+      console.error('Ошибка при выходе:', error);
+      await bot.sendMessage(chatId, '❌ Произошла ошибка при выходе.');
     }
-  }
-};
+  });
+}
+
+module.exports = authHandlers;
